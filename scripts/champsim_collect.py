@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Run ChampSim configurations and export key metrics to CSV."""
+"""Run ChampSim configurations and export ROI metrics to CSV."""
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import glob
 import re
 import shlex
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
@@ -27,7 +29,6 @@ BASE_COLUMNS = [
     "branch_mpki",
     "avg_rob_occupancy_at_mispredict",
 ]
-
 
 NUM_CPUS_RE = re.compile(r"^Number of CPUs: (?P<num_cpus>\d+)")
 PAGE_SIZE_RE = re.compile(r"^Page size: (?P<page_size>\d+)")
@@ -58,6 +59,22 @@ DBUS_RE = re.compile(r"^\s+AVG DBUS CONGESTED CYCLE:\s+(?P<avg>\S+)")
 WQ_FULL_RE = re.compile(r"^\s+FULL:\s+(?P<full>\d+)")
 
 
+@dataclass(frozen=True)
+class RunSpec:
+    index: int
+    total: int
+    exe: Path
+    trace: Path
+
+
+@dataclass(frozen=True)
+class RunResult:
+    index: int
+    row: dict[str, str]
+    returncode: int
+    timed_out: bool = False
+
+
 def parse_number(value: str) -> str:
     return "" if value == "-" else value
 
@@ -72,16 +89,20 @@ def slug_trace(path: Path) -> str:
 
 def resolve_paths(items: Iterable[str], base: Path) -> list[Path]:
     resolved: list[Path] = []
+    seen: set[Path] = set()
     for item in items:
         item_path = Path(item)
         search_pattern = str(item_path if item_path.is_absolute() else base / item_path)
-        matches = [Path(p) for p in glob.glob(search_pattern)]
+        matches = sorted(Path(p) for p in glob.glob(search_pattern))
         if not matches:
             matches = [item_path]
         for path in matches:
             if not path.is_absolute():
                 path = base / path
-            resolved.append(path.resolve())
+            path = path.resolve()
+            if path not in seen:
+                resolved.append(path)
+                seen.add(path)
     return resolved
 
 
@@ -173,26 +194,48 @@ def parse_champsim_output(text: str) -> dict[str, str]:
     return row
 
 
-def run_one(exe: Path, trace: Path, args: argparse.Namespace, run_id: int) -> dict[str, str]:
-    log_path = None
-    if args.log_dir:
-        args.log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = args.log_dir / f"{run_id:04d}_{exe.name}_{slug_trace(trace)}.log"
-
-    command = [
-        str(exe),
+def make_command(spec: RunSpec, args: argparse.Namespace) -> list[str]:
+    return [
+        str(spec.exe),
         "--warmup-instructions",
         str(args.warmup_instructions),
         "--simulation-instructions",
         str(args.simulation_instructions),
         *args.sim_arg,
-        str(trace),
+        str(spec.trace),
     ]
 
-    print(f"[{run_id}] {' '.join(shlex.quote(part) for part in command)}", flush=True)
-    output_parts: list[str] = []
-    returncode = -1
 
+def log_path_for(spec: RunSpec, args: argparse.Namespace) -> Path | None:
+    if not args.log_dir:
+        return None
+    return args.log_dir / f"{spec.index:04d}_{spec.exe.name}_{slug_trace(spec.trace)}.log"
+
+
+def run_buffered(command: list[str], args: argparse.Namespace) -> tuple[int, str, bool]:
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=args.champsim_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=args.timeout,
+            check=False,
+        )
+        return completed.returncode, completed.stdout, False
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        return -9, f"{stdout}{stderr}\n[TIMEOUT]\n", True
+
+
+def run_streaming(command: list[str], args: argparse.Namespace) -> tuple[int, str, bool]:
+    output_parts: list[str] = []
     with subprocess.Popen(
         command,
         cwd=args.champsim_root,
@@ -202,36 +245,39 @@ def run_one(exe: Path, trace: Path, args: argparse.Namespace, run_id: int) -> di
         bufsize=1,
     ) as proc:
         assert proc.stdout is not None
-        log_file = open(log_path, "w", encoding="utf-8") if log_path else None
-        try:
-            for line in proc.stdout:
-                output_parts.append(line)
-                if log_file:
-                    log_file.write(line)
-                if not args.quiet:
-                    print(line, end="")
-            returncode = proc.wait(timeout=args.timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            output_parts.append("\n[TIMEOUT]\n")
-            returncode = -9
-        finally:
-            if log_file:
-                log_file.close()
+        for line in proc.stdout:
+            output_parts.append(line)
+            print(line, end="")
+        return proc.wait(), "".join(output_parts), False
 
-    parsed = parse_champsim_output("".join(output_parts))
-    if returncode != 0:
-        print(f"warning: run {run_id} exited with status {returncode}", file=sys.stderr)
 
-    parsed.update(
+def run_one(spec: RunSpec, args: argparse.Namespace, stream_output: bool) -> RunResult:
+    command = make_command(spec, args)
+    log_path = log_path_for(spec, args)
+
+    if stream_output and args.timeout is None:
+        returncode, output, timed_out = run_streaming(command, args)
+    else:
+        returncode, output, timed_out = run_buffered(command, args)
+
+    if log_path:
+        log_path.write_text(output, encoding="utf-8")
+
+    row = parse_champsim_output(output)
+    row.update(
         {
-            "executable": exe.name,
-            "trace": slug_trace(trace),
+            "executable": spec.exe.name,
+            "trace": slug_trace(spec.trace),
             "warmup_instructions": str(args.warmup_instructions),
             "simulation_instructions": str(args.simulation_instructions),
         }
     )
-    return parsed
+
+    if returncode != 0:
+        reason = "timed out" if timed_out else f"exited with status {returncode}"
+        print(f"warning: run {spec.index} {reason}", file=sys.stderr)
+
+    return RunResult(spec.index, row, returncode, timed_out)
 
 
 def write_csv(path: Path, rows: list[dict[str, str]], append: bool) -> None:
@@ -257,24 +303,75 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(description="Run ChampSim and collect ROI metrics into CSV.")
     parser.add_argument("--champsim-root", type=Path, default=default_champsim_root, help="ChampSim repository path.")
-    parser.add_argument("--exe", action="append", required=True, help="Executable path. Relative paths are resolved from --champsim-root.")
+    parser.add_argument("--exe", action="append", required=True, help="ChampSim executable. Relative paths are resolved from --champsim-root.")
     parser.add_argument("--trace", action="append", required=True, help="Trace path or glob. Relative paths are resolved from --champsim-root.")
     parser.add_argument("--warmup-instructions", type=int, default=5_000_000)
     parser.add_argument("--simulation-instructions", type=int, default=20_000_000)
     parser.add_argument("--output", type=Path, required=True, help="Output CSV path.")
     parser.add_argument("--log-dir", type=Path, default=None, help="Optional directory for raw ChampSim logs.")
-    parser.add_argument("--append", action="store_true", help="Append to an existing CSV, rewriting it with a merged header.")
-    parser.add_argument("--quiet", action="store_true", help="Do not stream ChampSim output to the terminal.")
+    parser.add_argument("--append", action="store_true", help="Append new rows to an existing CSV.")
+    parser.add_argument("--quiet", action="store_true", help="Do not print ChampSim stdout. Recommended with --jobs > 1.")
+    parser.add_argument("--jobs", type=int, default=1, help="Number of ChampSim processes to run concurrently.")
     parser.add_argument("--timeout", type=float, default=None, help="Per-run timeout in seconds.")
-    parser.add_argument("--sim-arg", action="append", default=[], help="Extra argument passed to ChampSim before the trace path.")
+    parser.add_argument("--sim-arg", action="append", default=[], help="Extra argument passed to ChampSim before the trace path. Repeat if needed.")
     return parser.parse_args()
+
+
+def print_run_start(spec: RunSpec, args: argparse.Namespace) -> None:
+    command = make_command(spec, args)
+    print(f"[{spec.index}/{spec.total}] {' '.join(shlex.quote(part) for part in command)}", flush=True)
+
+
+def print_run_finish(result: RunResult, spec: RunSpec) -> None:
+    status = "timeout" if result.timed_out else ("ok" if result.returncode == 0 else f"exit {result.returncode}")
+    ipc = result.row.get("ipc", "")
+    ipc_suffix = f" IPC={ipc}" if ipc else ""
+    print(f"[{spec.index}/{spec.total}] done {status}: {spec.exe.name} {slug_trace(spec.trace)}{ipc_suffix}", flush=True)
+
+
+def run_all(specs: list[RunSpec], args: argparse.Namespace) -> list[RunResult]:
+    if args.jobs == 1:
+        results = []
+        for spec in specs:
+            print_run_start(spec, args)
+            result = run_one(spec, args, stream_output=not args.quiet)
+            results.append(result)
+            if args.quiet:
+                print_run_finish(result, spec)
+        return results
+
+    print(f"Running {len(specs)} runs with {args.jobs} concurrent jobs", flush=True)
+    results_by_index: dict[int, RunResult] = {}
+    spec_by_index = {spec.index: spec for spec in specs}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
+        future_to_spec = {}
+        for spec in specs:
+            print_run_start(spec, args)
+            future_to_spec[executor.submit(run_one, spec, args, False)] = spec
+
+        try:
+            for future in concurrent.futures.as_completed(future_to_spec):
+                spec = future_to_spec[future]
+                result = future.result()
+                results_by_index[result.index] = result
+                print_run_finish(result, spec)
+        except KeyboardInterrupt:
+            executor.shutdown(cancel_futures=True)
+            raise
+
+    return [results_by_index[index] for index in sorted(spec_by_index)]
 
 
 def main() -> int:
     args = parse_args()
     args.champsim_root = args.champsim_root.resolve()
+    if args.jobs < 1:
+        print("error: --jobs must be at least 1", file=sys.stderr)
+        return 2
     if args.log_dir:
         args.log_dir = args.log_dir.resolve()
+        args.log_dir.mkdir(parents=True, exist_ok=True)
 
     executables = resolve_paths(args.exe, args.champsim_root)
     traces = resolve_paths(args.trace, args.champsim_root)
@@ -285,16 +382,18 @@ def main() -> int:
             print(f"error: path does not exist: {path}", file=sys.stderr)
         return 2
 
-    rows: list[dict[str, str]] = []
-    run_id = 1
-    for exe in executables:
-        for trace in traces:
-            rows.append(run_one(exe, trace, args, run_id))
-            run_id += 1
+    total = len(executables) * len(traces)
+    specs = [
+        RunSpec(index + 1, total, exe, trace)
+        for index, (exe, trace) in enumerate((exe, trace) for exe in executables for trace in traces)
+    ]
+
+    results = run_all(specs, args)
+    rows = [result.row for result in results]
 
     write_csv(args.output, rows, args.append)
     print(f"Wrote {len(rows)} new row(s) to {args.output}")
-    return 0
+    return 1 if any(result.returncode != 0 for result in results) else 0
 
 
 if __name__ == "__main__":
