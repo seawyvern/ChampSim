@@ -76,7 +76,7 @@ class RunResult:
 
 
 def parse_number(value: str) -> str:
-    return "" if value == "-" else value
+    return value
 
 
 def slug_trace(path: Path) -> str:
