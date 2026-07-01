@@ -1,5 +1,5 @@
 {
-  "executable_name": "1C.fullBW.baseline",
+  "executable_name": "1C.fullBW.berti_only",
   "block_size": 64,
   "page_size": 4096,
   "heartbeat_frequency": 100000,
